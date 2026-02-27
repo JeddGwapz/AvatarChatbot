@@ -1,437 +1,506 @@
-const chatList = document.getElementById("chatList");
-const micBtn = document.getElementById("micBtn");
-const keyboardBtn = document.getElementById("keyboardBtn");
-const typingTray = document.getElementById("typingTray");
-const textInput = document.getElementById("textInput");
-const sendBtn = document.getElementById("sendBtn");
-const statusText = document.getElementById("statusText");
-const avatarWrap = document.getElementById("avatarWrap");
-const langBadge = document.getElementById("langBadge");
+// Crystal Prompter — app.js
+// Handles: datetime, lang, category, settings, avatar, mic/voice, chat
 
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-const hasSpeechRecognition = Boolean(SpeechRecognition);
-const hasTTS = "speechSynthesis" in window;
-const VISEME_CLASSES = ["viseme-rest", "viseme-open", "viseme-wide", "viseme-round", "viseme-tight", "viseme-closed"];
-const LANGUAGE_OPTIONS = [
-  { id: "auto", badge: "AUTO", label: "Auto", preferredLanguage: null, speechCode: null },
-  { id: "en", badge: "EN", label: "English", preferredLanguage: "English", speechCode: "en-US" },
-  { id: "ceb", badge: "CEB", label: "Cebuano", preferredLanguage: "Cebuano", speechCode: "fil-PH" },
-  { id: "fil", badge: "FIL", label: "Filipino", preferredLanguage: "Filipino", speechCode: "fil-PH" },
-  { id: "es", badge: "ES", label: "Spanish", preferredLanguage: "Spanish", speechCode: "es-ES" },
-  { id: "ko", badge: "KO", label: "Korean", preferredLanguage: "Korean", speechCode: "ko-KR" }
-];
-
-const state = {
-  history: [],
-  isListening: false,
-  typedMode: false,
-  recognition: null,
-  voices: [],
-  visemeResetTimer: null,
-  lipTimelineTimers: [],
-  languageIndex: 0
+// ── State ─────────────────────────────────────────────────────────────────────
+const S = {
+  lang:         'en',
+  gender:       'male',
+  category:     'text',
+  loading:      false,
+  recording:    false,
+  kbMode:       false,   // double-tap toggles keyboard input
+  lastTap:      0,
 };
 
-function detectLanguageCode(text = "") {
-  if (/[\uac00-\ud7af]/.test(text)) return "ko-KR";
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
 
-  const lower = text.toLowerCase();
+const avatarImg    = $('avatarImg');
+const avatarStage  = $('avatarStage');
+const avStatus     = $('avStatus');
+const chatMessages = $('chatMessages');
+const chatInput    = $('chatInput');
+const btnSend      = $('btnSend');
+const btnMic       = $('btnMic');
+const micIcon      = $('micIcon');
+const btnLangToggle= $('btnLangToggle');
+const langLabel    = $('langLabel');
+const langPicker   = $('langPicker');
+const btnSettings  = $('btnSettings');
+const settingsOverlay = $('settingsOverlay');
+const btnCloseSettings = $('btnCloseSettings');
+const customColor  = $('customColor');
+const headerDate   = $('headerDate');
+const headerTime   = $('headerTime');
+const inputBar     = document.querySelector('.input-bar');
 
-  const cebuanoTokens = ["unsa", "nako", "imong", "ngano", "palihug", "pud", "ra", "sige", "gani"];
-  const filipinoTokens = ["kamusta", "salamat", "bakit", "pwede", "hindi", "opo", "sige"];
-  const spanishTokens = ["hola", "gracias", "por favor", "necesito", "donde", "ayuda"];
-
-  const score = (tokens) => tokens.reduce((sum, token) => sum + (lower.includes(token) ? 1 : 0), 0);
-
-  const ceb = score(cebuanoTokens);
-  const fil = score(filipinoTokens);
-  const es = score(spanishTokens);
-
-  if (ceb >= 2) return "ceb-PH";
-  if (fil >= 2) return "fil-PH";
-  if (es >= 2) return "es-ES";
-
-  return navigator.language || "en-US";
-}
-
-function badgeFromLang(lang) {
-  const short = (lang || "en").split("-")[0].toUpperCase();
-  return short.slice(0, 3);
-}
-
-function getSelectedLanguage() {
-  return LANGUAGE_OPTIONS[state.languageIndex] || LANGUAGE_OPTIONS[0];
-}
-
-function renderLanguageBadge() {
-  const selected = getSelectedLanguage();
-  langBadge.textContent = selected.badge;
-  langBadge.title = `Current language: ${selected.label}`;
-}
-
-function cycleLanguage() {
-  state.languageIndex = (state.languageIndex + 1) % LANGUAGE_OPTIONS.length;
-  renderLanguageBadge();
-
-  const selected = getSelectedLanguage();
-  if (selected.id === "auto") {
-    setStatus("Language mode: Auto");
-  } else {
-    setStatus(`Language mode: ${selected.label}`);
-  }
-}
-
-function appendBubble(role, text) {
-  const bubble = document.createElement("div");
-  bubble.className = `bubble ${role === "assistant" ? "ai" : "user"}`;
-  bubble.textContent = text;
-  chatList.appendChild(bubble);
-  chatList.scrollTop = chatList.scrollHeight;
-}
-
-function setStatus(text) {
-  statusText.textContent = text;
-}
-
-function setSpeakingVisual(isSpeaking) {
-  avatarWrap.classList.toggle("speaking", isSpeaking);
-  if (!isSpeaking) {
-    clearLipTimers();
-    setViseme("viseme-rest");
-  }
-}
-
-function clearLipTimers() {
-  if (state.visemeResetTimer) {
-    clearTimeout(state.visemeResetTimer);
-    state.visemeResetTimer = null;
-  }
-  if (state.lipTimelineTimers.length) {
-    for (const timer of state.lipTimelineTimers) {
-      clearTimeout(timer);
-    }
-    state.lipTimelineTimers = [];
-  }
-}
-
-function setViseme(visemeClass) {
-  for (const className of VISEME_CLASSES) {
-    avatarWrap.classList.remove(className);
-  }
-  avatarWrap.classList.add(visemeClass);
-}
-
-function visemeFromChunk(chunk = "") {
-  const firstHangul = chunk.match(/[\uac00-\ud7af]/)?.[0];
-  if (firstHangul) {
-    const baseCode = firstHangul.charCodeAt(0) - 0xac00;
-    const jung = Math.floor((baseCode % 588) / 28);
-    const jong = baseCode % 28;
-
-    if ([8, 13, 18].includes(jung)) return "viseme-round";
-    if ([0, 2, 3, 6].includes(jung)) return "viseme-open";
-    if ([20].includes(jung)) return "viseme-tight";
-    if (jong > 0) return "viseme-closed";
-    return "viseme-wide";
-  }
-
-  const text = chunk.toLowerCase();
-
-  if (/[bmpm]/.test(text)) return "viseme-closed";
-  if (/[fv]/.test(text)) return "viseme-tight";
-  if (/[ou]/.test(text)) return "viseme-round";
-  if (/[aei]/.test(text)) return "viseme-open";
-  if (/[wry]/.test(text)) return "viseme-round";
-  if (/[stzdnl]/.test(text)) return "viseme-wide";
-
-  return "viseme-wide";
-}
-
-function triggerVisemePulse(chunk = "") {
-  const visemeClass = visemeFromChunk(chunk);
-  setViseme(visemeClass);
-
-  if (state.visemeResetTimer) {
-    clearTimeout(state.visemeResetTimer);
-  }
-  state.visemeResetTimer = setTimeout(() => {
-    setViseme("viseme-rest");
-  }, 110);
-}
-
-function tokenizeSpeech(text = "") {
-  return String(text)
-    .split(/(\s+|[,.!?;:])/)
-    .filter((token) => token && token.length);
-}
-
-function estimateTokenDuration(token = "", rate = 1) {
-  const safeRate = Number.isFinite(rate) && rate > 0 ? rate : 1;
-  if (/^\s+$/.test(token)) return 55 / safeRate;
-  if (/^[,.!?;:]$/.test(token)) return 130 / safeRate;
-
-  const core = token.replace(/[^A-Za-z\uac00-\ud7af0-9]/g, "");
-  const unitCount = Math.max(core.length, 1);
-  return Math.max(80, Math.min(300, unitCount * 68)) / safeRate;
-}
-
-function queueViseme(visemeClass, delayMs) {
-  const timer = setTimeout(() => {
-    setViseme(visemeClass);
-  }, Math.max(0, delayMs));
-  state.lipTimelineTimers.push(timer);
-}
-
-function startLipSyncTimeline(text, rate = 1) {
-  clearLipTimers();
-  setViseme("viseme-rest");
-
-  const tokens = tokenizeSpeech(text);
-  if (!tokens.length) return;
-
-  let cursor = 0;
-  for (const token of tokens) {
-    const duration = estimateTokenDuration(token, rate);
-
-    if (!/^\s+$/.test(token)) {
-      const visemeClass = visemeFromChunk(token);
-      queueViseme(visemeClass, cursor);
-      queueViseme("viseme-rest", cursor + duration * 0.72);
-    }
-
-    cursor += duration;
-  }
-  queueViseme("viseme-rest", cursor + 70);
-}
-
-function updateLanguageBadgeFromText(text) {
-  const selected = getSelectedLanguage();
-  if (selected.id !== "auto") return;
-
-  const langCode = detectLanguageCode(text);
-  langBadge.textContent = badgeFromLang(langCode);
-}
-
-function getPreferredVoice(langCode) {
-  const langPrefix = langCode.split("-")[0].toLowerCase();
-  const voiceList = state.voices;
-
-  if (!voiceList.length) return null;
-
-  const premiumHint = /(natural|neural|enhanced|premium|google)/i;
-  const maleHint =
-    /(male|man|david|daniel|alex|fred|jorge|diego|carlos|paul|thomas|joey|liam|james|john|michael|mark)/i;
-  const femaleHint = /(female|woman|samantha|karen|victoria|zira|hazel|susan|aria)/i;
-
-  const inLang = voiceList.filter((voice) => voice.lang.toLowerCase().startsWith(langPrefix));
-  const maleInLang = inLang.filter((voice) => maleHint.test(voice.name) && !femaleHint.test(voice.name));
-  const premiumMaleInLang = maleInLang.find((voice) => premiumHint.test(voice.name));
-
-  return (
-    premiumMaleInLang ||
-    maleInLang[0] ||
-    inLang.find((voice) => premiumHint.test(voice.name)) ||
-    inLang[0] ||
-    voiceList.find((voice) => maleHint.test(voice.name) && !femaleHint.test(voice.name)) ||
-    voiceList[0]
-  );
-}
-
-function speakReply(text) {
-  if (!hasTTS || !text) return;
-
-  const langCode = detectLanguageCode(text);
-  const utterance = new SpeechSynthesisUtterance(text);
-  const voice = getPreferredVoice(langCode);
-
-  utterance.lang = voice?.lang || langCode;
-  utterance.voice = voice || null;
-  utterance.rate = 1;
-  utterance.pitch = 0.86;
-
-  utterance.onstart = () => {
-    setSpeakingVisual(true);
-    startLipSyncTimeline(text, utterance.rate);
-  };
-  utterance.onboundary = (event) => {
-    const start = Number.isFinite(event.charIndex) ? event.charIndex : 0;
-    const chunk = text.slice(start, start + 6);
-    triggerVisemePulse(chunk);
-  };
-  utterance.onend = () => setSpeakingVisual(false);
-  utterance.onerror = () => setSpeakingVisual(false);
-
-  window.speechSynthesis.cancel();
-  window.speechSynthesis.speak(utterance);
-}
-
-async function getAssistantReply(message) {
-  const selected = getSelectedLanguage();
-
-  const response = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      history: state.history.slice(-8),
-      preferredLanguage: selected.preferredLanguage
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error("Failed to get assistant reply.");
-  }
-
-  return response.json();
-}
-
-async function submitMessage(message) {
-  const cleaned = (message || "").trim();
-  if (!cleaned) return;
-
-  updateLanguageBadgeFromText(cleaned);
-  appendBubble("user", cleaned);
-  state.history.push({ role: "user", content: cleaned });
-  setStatus("Assistant is thinking...");
-
+function getClientApiKey() {
   try {
-    const data = await getAssistantReply(cleaned);
-    const reply = data.reply || "I could not generate a reply yet.";
+    const savedKey = (localStorage.getItem('CRYSTAL_API_KEY') || '').trim();
+    return savedKey;
+  } catch {
+    return '';
+  }
+}
 
-    appendBubble("assistant", reply);
-    state.history.push({ role: "assistant", content: reply });
-    if (data.providerError) {
-      const quotaIssue = data.providerError.includes("429") || data.providerError.toLowerCase().includes("quota");
-      setStatus(
-        quotaIssue
-          ? "Provider quota reached. Check Gemini/OpenAI usage and billing."
-          : "Provider request failed. Using fallback reply."
-      );
-    } else {
-      setStatus(data.mode === "fallback" ? "Fallback mode: add GEMINI_API_KEY or OPENAI_API_KEY in .env." : "Ready.");
+// ── Date & Time ───────────────────────────────────────────────────────────────
+function updateClock() {
+  const now  = new Date();
+  const dOpt = { weekday: 'short', month: 'short', day: 'numeric' };
+  const tOpt = { hour: 'numeric', minute: '2-digit', hour12: true };
+  headerDate.textContent = now.toLocaleDateString('en-US', dOpt);
+  headerTime.textContent = now.toLocaleTimeString('en-US', tOpt);
+}
+updateClock();
+setInterval(updateClock, 1000);
+
+// ── Language ──────────────────────────────────────────────────────────────────
+const LANGS = {
+  auto: { display: '🌐 AUTO', code: '' },
+  en:   { display: '🇺🇸 EN',   code: 'en-US' },
+  ceb:  { display: '🇵🇭 CEB',  code: 'fil-PH' },
+  fil:  { display: '🇵🇭 FIL',  code: 'fil-PH' },
+  es:   { display: '🇪🇸 ES',   code: 'es-ES' },
+  ko:   { display: '🇰🇷 KO',   code: 'ko-KR' },
+};
+
+// ── TTS bootstrap ─────────────────────────────────────────────────────────────
+let availableVoices = [];
+let speechUnlocked = false;
+let speakingGuardTimer = null;
+
+function loadVoices() {
+  if (!('speechSynthesis' in window)) return;
+  availableVoices = window.speechSynthesis.getVoices() || [];
+}
+
+function primeSpeech() {
+  if (!('speechSynthesis' in window)) return;
+  // Helps browsers that require an explicit user gesture before audio output.
+  window.speechSynthesis.resume();
+  loadVoices();
+}
+
+function unlockSpeechFromGesture() {
+  if (!('speechSynthesis' in window) || speechUnlocked) return;
+  try {
+    const unlock = new SpeechSynthesisUtterance(' ');
+    unlock.volume = 0;
+    unlock.rate = 1;
+    unlock.pitch = 1;
+    window.speechSynthesis.speak(unlock);
+    window.speechSynthesis.cancel();
+    speechUnlocked = true;
+  } catch {
+    // no-op
+  }
+}
+
+function waitForVoices(timeoutMs = 1200) {
+  if (!('speechSynthesis' in window)) return Promise.resolve();
+  loadVoices();
+  if (availableVoices.length) return Promise.resolve();
+
+  return new Promise(resolve => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      loadVoices();
+      if (availableVoices.length || Date.now() - started >= timeoutMs) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 100);
+  });
+}
+
+function pickVoice(langCode) {
+  if (!availableVoices.length) return null;
+  const normalized = (langCode || 'en-US').toLowerCase();
+  const exact = availableVoices.find(v => v.lang && v.lang.toLowerCase() === normalized);
+  if (exact) return exact;
+  const short = normalized.split('-')[0];
+  return availableVoices.find(v => v.lang && v.lang.toLowerCase().startsWith(short)) || null;
+}
+
+if ('speechSynthesis' in window) {
+  loadVoices();
+  window.speechSynthesis.onvoiceschanged = loadVoices;
+  document.addEventListener('pointerdown', () => {
+    primeSpeech();
+    unlockSpeechFromGesture();
+  }, { once: true });
+}
+
+function setLang(lang) {
+  S.lang = lang;
+  langLabel.textContent = LANGS[lang]?.display ?? '🌐';
+
+  // sync all lang buttons
+  document.querySelectorAll('.lang-pick-btn, .lang-opt').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.lang === lang);
+  });
+  langPicker.classList.remove('open');
+}
+
+btnLangToggle.addEventListener('click', e => {
+  e.stopPropagation();
+  langPicker.classList.toggle('open');
+});
+document.querySelectorAll('.lang-pick-btn').forEach(btn =>
+  btn.addEventListener('click', () => setLang(btn.dataset.lang))
+);
+document.addEventListener('click', e => {
+  if (!langPicker.contains(e.target) && e.target !== btnLangToggle)
+    langPicker.classList.remove('open');
+});
+
+// ── Category ──────────────────────────────────────────────────────────────────
+const CAT_PLACEHOLDERS = {
+  text:   'Ask me to write something...',
+  photos: 'Describe a photo you want...',
+  slides: 'What slides do you need?',
+  videos: 'Describe your video concept...',
+  '3d':   'What 3D model should I create?',
+};
+
+document.querySelectorAll('.cat-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    S.category = btn.dataset.category;
+    chatInput.placeholder = CAT_PLACEHOLDERS[S.category] ?? 'Ask Anything...';
+  });
+});
+
+// ── Quick Chips ───────────────────────────────────────────────────────────────
+document.querySelectorAll('.chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    unlockSpeechFromGesture();
+    chatInput.value = chip.dataset.prompt;
+    sendMessage();
+  });
+});
+
+// ── Avatar ────────────────────────────────────────────────────────────────────
+const AVATAR_SRC = {
+  male:   './avatar-male.svg',
+  female: './avatar-female.svg',
+};
+const AVATAR_FALLBACK = {
+  male:   './avatar-female.svg',
+  female: './avatar-male.svg',
+};
+
+function setAvatar(gender) {
+  S.gender = gender;
+  avatarImg.src = AVATAR_SRC[gender];
+  avatarImg.onerror = () => { avatarImg.src = AVATAR_FALLBACK[gender]; };
+  document.querySelectorAll('.gender-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.gender === gender);
+  });
+}
+
+document.querySelectorAll('.gender-btn').forEach(btn =>
+  btn.addEventListener('click', () => setAvatar(btn.dataset.gender))
+);
+
+function setSpeaking(on) {
+  avatarStage.classList.toggle('speaking', on);
+  avStatus.innerHTML = on
+    ? '<span class="dot" style="background:#f59e0b"></span>Speaking...'
+    : '<span class="dot"></span>Online';
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+function openSettings()  {
+  settingsOverlay.classList.add('open');
+  settingsOverlay.setAttribute('aria-hidden', 'false');
+}
+function closeSettings() {
+  settingsOverlay.classList.remove('open');
+  settingsOverlay.setAttribute('aria-hidden', 'true');
+}
+btnSettings.addEventListener('click', openSettings);
+btnCloseSettings.addEventListener('click', closeSettings);
+settingsOverlay.addEventListener('click', e => {
+  if (e.target === settingsOverlay) closeSettings();
+});
+
+// Theme swatches
+document.querySelectorAll('.swatch[data-theme]').forEach(sw => {
+  sw.addEventListener('click', () => {
+    document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
+    sw.classList.add('active');
+    // remove all theme-* classes
+    document.body.className = document.body.className
+      .split(' ').filter(c => !c.startsWith('theme-')).join(' ');
+    document.body.classList.add(`theme-${sw.dataset.theme}`);
+    // clear any custom CSS var
+    document.documentElement.style.removeProperty('--bg-from');
+    document.documentElement.style.removeProperty('--bg-to');
+    document.documentElement.style.removeProperty('--accent');
+  });
+});
+
+// Custom color picker
+document.querySelector('.custom-swatch').addEventListener('click', () => {
+  customColor.click();
+});
+customColor.addEventListener('input', () => {
+  document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
+  document.body.className = document.body.className
+    .split(' ').filter(c => !c.startsWith('theme-')).join(' ');
+
+  const hex = customColor.value;
+  // Generate a darker tone for gradient end
+  const r = parseInt(hex.slice(1,3), 16);
+  const g = parseInt(hex.slice(3,5), 16);
+  const b = parseInt(hex.slice(5,7), 16);
+  const dark = `#${Math.floor(r*0.55).toString(16).padStart(2,'0')}${Math.floor(g*0.55).toString(16).padStart(2,'0')}${Math.floor(b*0.55).toString(16).padStart(2,'0')}`;
+  document.documentElement.style.setProperty('--bg-from', hex);
+  document.documentElement.style.setProperty('--bg-to', dark);
+  document.documentElement.style.setProperty('--accent', dark);
+});
+
+// Language options inside settings modal
+document.querySelectorAll('.lang-opt').forEach(btn =>
+  btn.addEventListener('click', () => setLang(btn.dataset.lang))
+);
+
+// ── Voice / Mic ───────────────────────────────────────────────────────────────
+const MIC_SVG = `<svg viewBox="0 0 24 24" fill="currentColor">
+  <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+  <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+</svg>`;
+
+const KB_SVG = `<svg viewBox="0 0 24 24" fill="currentColor">
+  <path d="M20 5H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm-9 3h2v2h-2V8zm0 3h2v2h-2v-2zM8 8h2v2H8V8zm0 3h2v2H8v-2zm-1 5H5v-2h2v2zm10 0H7v-2h10v2zm0-3h-2v-2h2v2zm0-3h-2V8h2v2zm3 6h-2v-2h2v2z"/>
+</svg>`;
+
+let recognition = null;
+if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SR();
+  recognition.continuous = false;
+  recognition.interimResults = true;
+
+  recognition.onstart = () => {
+    S.recording = true;
+    btnMic.classList.add('recording');
+  };
+  recognition.onresult = e => {
+    const t = Array.from(e.results).map(r => r[0].transcript).join('');
+    chatInput.value = t;
+    if (e.results[e.results.length - 1].isFinal) {
+      S.recording = false;
+      btnMic.classList.remove('recording');
+      sendMessage();
     }
-    speakReply(reply);
-  } catch (error) {
-    appendBubble("assistant", "I ran into an error. Please try again.");
-    setStatus("Server error. Check terminal logs.");
-    console.error(error);
-  }
+  };
+  recognition.onerror = recognition.onend = () => {
+    S.recording = false;
+    btnMic.classList.remove('recording');
+  };
 }
 
-function toggleTypedMode() {
-  state.typedMode = !state.typedMode;
-  typingTray.classList.toggle("hidden", !state.typedMode);
-  keyboardBtn.classList.toggle("active", state.typedMode);
-
-  if (state.typedMode) {
-    textInput.focus();
-  }
+function toggleKbMode(on) {
+  S.kbMode = on;
+  micIcon.innerHTML = on ? KB_SVG : MIC_SVG;
+  btnMic.classList.toggle('kb-mode', on);
+  if (on) chatInput.focus();
 }
 
-function initVoices() {
-  const voices = window.speechSynthesis.getVoices();
-  if (voices.length) {
-    state.voices = voices;
-  }
-}
+btnMic.addEventListener('click', () => {
+  const now = Date.now();
+  const gap  = now - S.lastTap;
+  S.lastTap  = now;
 
-function stopListening() {
-  if (!state.recognition || !state.isListening) return;
-
-  state.isListening = false;
-  micBtn.classList.remove("active");
-  state.recognition.stop();
-  setStatus("Voice input stopped.");
-}
-
-function startListening() {
-  if (!hasSpeechRecognition) {
-    setStatus("Speech recognition is not supported in this browser.");
+  // Double-tap (< 350 ms) → toggle keyboard mode
+  if (gap < 350) {
+    toggleKbMode(!S.kbMode);
     return;
   }
 
-  if (!state.recognition) {
-    const recognition = new SpeechRecognition();
-    recognition.interimResults = true;
-    recognition.continuous = false;
-    recognition.maxAlternatives = 1;
+  // Single tap
+  if (S.kbMode) { chatInput.focus(); return; }
 
-    recognition.onstart = () => {
-      state.isListening = true;
-      micBtn.classList.add("active");
-      setStatus("Listening... Speak now.");
-    };
+  if (!recognition) { toggleKbMode(true); return; }
 
-    recognition.onresult = async (event) => {
-      let finalText = "";
-
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        const transcript = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          finalText += transcript;
-        } else {
-          setStatus(`Listening: ${transcript}`);
-        }
-      }
-
-      if (finalText.trim()) {
-        await submitMessage(finalText.trim());
-      }
-    };
-
-    recognition.onend = () => {
-      state.isListening = false;
-      micBtn.classList.remove("active");
-      if (!statusText.textContent.startsWith("Assistant")) {
-        setStatus("Ready. Ask by voice or text.");
-      }
-    };
-
-    recognition.onerror = (event) => {
-      state.isListening = false;
-      micBtn.classList.remove("active");
-
-      if (event.error === "not-allowed") {
-        setStatus("Microphone permission blocked. Allow mic access and retry.");
-      } else {
-        setStatus(`Voice error: ${event.error}`);
-      }
-    };
-
-    state.recognition = recognition;
+  if (S.recording) {
+    recognition.stop();
+  } else {
+    recognition.lang = LANGS[S.lang]?.code || 'en-US';
+    try { recognition.start(); } catch (_) {}
   }
+});
 
-  const selected = getSelectedLanguage();
-  state.recognition.lang = selected.speechCode || navigator.language || "en-US";
-  state.recognition.start();
+// ── Chat / Send ───────────────────────────────────────────────────────────────
+chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    unlockSpeechFromGesture();
+    sendMessage();
+  }
+});
+btnSend.addEventListener('click', () => {
+  unlockSpeechFromGesture();
+  sendMessage();
+});
+
+function addMsg(text, role) {
+  const el = document.createElement('div');
+  el.className = `msg-bubble ${role}`;
+  el.textContent = text;
+  chatMessages.appendChild(el);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  return el;
 }
 
-micBtn.addEventListener("click", () => {
-  if (state.isListening) {
-    stopListening();
-  } else {
-    startListening();
+function addTyping() {
+  const el = document.createElement('div');
+  el.className = 'msg-bubble typing';
+  el.id = 'typingEl';
+  el.innerHTML = '<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>';
+  chatMessages.appendChild(el);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  return el;
+}
+
+let ttsUtterance = null;
+let inputPopupTimer = null;
+
+function ensureInputPopup() {
+  if (!inputBar) return null;
+  let popup = document.getElementById('inputPopup');
+  if (!popup) {
+    popup = document.createElement('div');
+    popup.id = 'inputPopup';
+    popup.className = 'input-popup';
+    inputBar.appendChild(popup);
   }
-});
+  return popup;
+}
 
-keyboardBtn.addEventListener("click", toggleTypedMode);
-langBadge.addEventListener("click", cycleLanguage);
+function showInputPopup(text, type = 'ai') {
+  const popup = ensureInputPopup();
+  if (!popup) return;
 
-sendBtn.addEventListener("click", () => {
-  submitMessage(textInput.value);
-  textInput.value = "";
-});
+  popup.textContent = text;
+  popup.classList.remove('show', 'error');
+  if (type === 'error') popup.classList.add('error');
 
-textInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    submitMessage(textInput.value);
-    textInput.value = "";
+  // restart animation
+  void popup.offsetWidth;
+  popup.classList.add('show');
+
+  clearTimeout(inputPopupTimer);
+  inputPopupTimer = setTimeout(() => popup.classList.remove('show'), 4500);
+}
+
+async function sendMessage() {
+  const text = chatInput.value.trim();
+  if (!text || S.loading) return;
+
+  chatInput.value = '';
+  S.loading = true;
+  btnSend.disabled = true;
+
+  addMsg(text, 'user');
+  const typing = addTyping();
+  setSpeaking(false);
+
+  try {
+    const apiKey = getClientApiKey();
+    const res  = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey ? { 'x-api-key': apiKey } : {}),
+      },
+      body: JSON.stringify({ message: text, language: S.lang, category: S.category }),
+    });
+    if (res.status === 401) {
+      typing.remove();
+      const msg = "⚠ Unauthorized. Set your key in browser: localStorage.setItem('CRYSTAL_API_KEY','your_key')";
+      addMsg(msg, 'ai');
+      showInputPopup(msg, 'error');
+      speak(msg);
+      return;
+    }
+    const data = await res.json();
+    typing.remove();
+
+    if (data.reply) {
+      addMsg(data.reply, 'ai');
+      showInputPopup(data.reply, 'ai');
+      speak(data.reply);
+    } else {
+      const msg = `⚠ ${data.error ?? 'Unknown error'}`;
+      addMsg(msg, 'ai');
+      showInputPopup(msg, 'error');
+      speak(msg);
+    }
+  } catch {
+    typing.remove();
+    const msg = '⚠ Connection error — is the server running?';
+    addMsg(msg, 'ai');
+    showInputPopup(msg, 'error');
+    speak(msg);
+  } finally {
+    S.loading = false;
+    btnSend.disabled = false;
   }
+}
+
+// TTS + avatar speaking animation
+async function speak(text) {
+  if (!('speechSynthesis' in window)) return;
+  const safeText = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!safeText) return;
+
+  primeSpeech();
+  unlockSpeechFromGesture();
+  await waitForVoices();
+  loadVoices();
+  window.speechSynthesis.cancel();
+  clearTimeout(speakingGuardTimer);
+
+  setSpeaking(true);
+  const utter = new SpeechSynthesisUtterance(safeText);
+  utter.lang  = LANGS[S.lang]?.code || 'en-US';
+  const voice = pickVoice(utter.lang);
+  if (voice) utter.voice = voice;
+  utter.volume = 1;
+  utter.rate  = 0.92;
+  utter.pitch = S.gender === 'female' ? 1.25 : 0.9;
+  let retried = false;
+
+  utter.onstart = () => { speechUnlocked = true; };
+  utter.onend   = () => setSpeaking(false);
+  utter.onerror = () => {
+    if (retried) {
+      setSpeaking(false);
+      return;
+    }
+    retried = true;
+    // Retry once after a brief resume in case browser blocked first attempt.
+    window.speechSynthesis.resume();
+    setTimeout(() => {
+      try { window.speechSynthesis.speak(utter); } catch { setSpeaking(false); }
+    }, 120);
+  };
+  ttsUtterance  = utter;
+  window.speechSynthesis.speak(utter);
+
+  // Safety fallback: stop animation after ~10 s
+  speakingGuardTimer = setTimeout(() => setSpeaking(false), Math.min(safeText.length * 65, 10000));
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeSettings(); langPicker.classList.remove('open'); }
 });
 
-window.speechSynthesis?.addEventListener("voiceschanged", initVoices);
-initVoices();
-renderLanguageBadge();
-
-appendBubble("assistant", "Hello. You can ask me by voice or text, and I will answer in your language.");
-setStatus(hasSpeechRecognition ? "Ready. Ask by voice or text." : "Voice input not supported. Use typing mode.");
+// ── Init ──────────────────────────────────────────────────────────────────────
+setLang('en');
+setAvatar('male');

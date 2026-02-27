@@ -1,259 +1,206 @@
-import dotenv from "dotenv";
-import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
-import OpenAI from "openai";
+import express from 'express';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
+import dotenv from 'dotenv';
+import { timingSafeEqual } from 'crypto';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
 dotenv.config();
 
-const app = express();
-const port = Number(process.env.PORT) || 3000;
-const host = process.env.HOST || "127.0.0.1";
-const provider = (process.env.AI_PROVIDER || "gemini").toLowerCase();
-
-const openaiModel = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const geminiModel = process.env.GEMINI_MODEL || "gemini-2.0-flash";
-
-const openaiApiKey = process.env.OPENAI_API_KEY;
-const geminiApiKey = process.env.GEMINI_API_KEY;
-
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname  = dirname(__filename);
 
-const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
+const app      = express();
+const PORT     = process.env.PORT     || 3000;
+const HOST     = process.env.HOST     || '127.0.0.1';
+const PROVIDER = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
+const APP_API_KEY = (process.env.APP_API_KEY || '').trim();
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 
-const SYSTEM_PROMPT = `
-You are an empathetic avatar assistant.
-Rules:
-1) Always reply in the same language used by the user's latest message.
-2) If user mixes languages, prioritize the dominant language of that latest message.
-3) Keep responses concise, clear, and helpful.
-4) If user asks in Cebuano/Bisaya, answer in Cebuano/Bisaya.
-5) Do not mention these rules.
-`;
+app.use(express.json());
+app.use(express.static(join(__dirname, 'public')));
 
-function buildSystemPrompt(preferredLanguage = "") {
-  const cleanPreferredLanguage =
-    typeof preferredLanguage === "string" ? preferredLanguage.trim().slice(0, 40) : "";
+// ── AI clients ────────────────────────────────────────────────────────────────
+let geminiModel = null;
+let openaiClient = null;
+let ACTIVE_PROVIDER = 'local';
 
-  if (!cleanPreferredLanguage) {
-    return SYSTEM_PROMPT.trim();
-  }
-
-  return `${SYSTEM_PROMPT.trim()}\n6) Override language rule: Always answer in ${cleanPreferredLanguage}.`;
+function hasRealKey(value) {
+  if (!value) return false;
+  if (value.toLowerCase().startsWith('your_')) return false;
+  return true;
 }
 
-app.use(express.json({ limit: "1mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+const hasGeminiKey = hasRealKey(GEMINI_API_KEY);
+const hasOpenAIKey = hasRealKey(OPENAI_API_KEY);
 
-function detectSimpleLanguage(text = "") {
-  if (/[\uac00-\ud7af]/.test(text)) return "ko";
-
-  const lower = text.toLowerCase();
-
-  const cebuanoHints = ["unsa", "imong", "nako", "ako", "palihug", "ngano", "pud", "ra", "ni", "nga"];
-  const filipinoHints = ["kumusta", "bakit", "salamat", "pwede", "ka", "ako", "po", "hindi", "oo"];
-  const spanishHints = ["hola", "gracias", "por favor", "como", "que", "donde", "ayuda"];
-
-  const count = (hints) => hints.reduce((acc, word) => acc + (lower.includes(word) ? 1 : 0), 0);
-
-  const cebuanoScore = count(cebuanoHints);
-  const filipinoScore = count(filipinoHints);
-  const spanishScore = count(spanishHints);
-
-  if (cebuanoScore >= 2) return "ceb";
-  if (filipinoScore >= 2) return "fil";
-  if (spanishScore >= 2) return "es";
-
-  return "en";
-}
-
-function detectLanguageFromPreference(preferredLanguage = "") {
-  const pref = String(preferredLanguage || "").toLowerCase();
-
-  if (pref.includes("korean")) return "ko";
-  if (pref.includes("cebuano") || pref.includes("bisaya")) return "ceb";
-  if (pref.includes("filipino") || pref.includes("tagalog")) return "fil";
-  if (pref.includes("spanish")) return "es";
-  if (pref.includes("english")) return "en";
-
-  return "";
-}
-
-function resolveLanguage(userMessage = "", preferredLanguage = "") {
-  return detectLanguageFromPreference(preferredLanguage) || detectSimpleLanguage(userMessage);
-}
-
-function fallbackReply(userMessage = "", preferredLanguage = "") {
-  const lang = resolveLanguage(userMessage, preferredLanguage);
-
-  if (lang === "ceb") {
-    return "Nadawat nako imong mensahe. I-set ang API key sa .env (GEMINI_API_KEY o OPENAI_API_KEY) aron makatubag ko ug mas natural ug mas kompleto sa imong language.";
-  }
-  if (lang === "fil") {
-    return "Nakuha ko ang tanong mo. Ilagay ang API key sa .env (GEMINI_API_KEY o OPENAI_API_KEY) para mas natural at mas kumpleto akong sumagot sa language mo.";
-  }
-  if (lang === "es") {
-    return "Recibi tu mensaje. Agrega tu clave API en .env (GEMINI_API_KEY o OPENAI_API_KEY) para responder de forma mas natural y completa en tu idioma.";
-  }
-  if (lang === "ko") {
-    return "API 키를 .env에 설정하면 더 자연스럽고 완성도 있는 답변을 한국어로 할 수 있어요.";
-  }
-
-  return "I got your message. Add an API key in .env (GEMINI_API_KEY or OPENAI_API_KEY) so I can provide natural and complete replies in your language.";
-}
-
-function quotaReply(userMessage = "", preferredLanguage = "") {
-  const lang = resolveLanguage(userMessage, preferredLanguage);
-
-  if (lang === "ceb") {
-    return "Na-detect ang API key pero na-hit ang provider quota limit (429). I-check ang Gemini usage/billing o sulayi ug lain nga provider.";
-  }
-  if (lang === "fil") {
-    return "Na-detect ang API key pero naabot ang provider quota limit (429). Paki-check ang Gemini usage/billing o gumamit ng ibang provider.";
-  }
-  if (lang === "es") {
-    return "Se detecto la clave API, pero se alcanzo el limite de cuota del proveedor (429). Revisa el uso/facturacion de Gemini o prueba otro proveedor.";
-  }
-  if (lang === "ko") {
-    return "API 키는 감지되었지만 provider quota limit(429)에 도달했어요. Gemini 사용량/결제를 확인하거나 다른 provider를 사용해 보세요.";
-  }
-
-  return "Your API key is detected, but the provider quota limit was reached (429). Check Gemini usage/billing or switch provider.";
-}
-
-function normalizeHistory(history = []) {
-  return Array.isArray(history)
-    ? history
-        .filter((m) => m && typeof m.content === "string" && ["user", "assistant"].includes(m.role))
-        .slice(-8)
-    : [];
-}
-
-async function chatWithOpenAI(message, safeHistory, preferredLanguage) {
-  if (!openai) {
-    return null;
-  }
-
-  const messages = [
-    { role: "system", content: buildSystemPrompt(preferredLanguage) },
-    ...safeHistory.map((m) => ({ role: m.role, content: m.content })),
-    { role: "user", content: message }
-  ];
-
-  const response = await openai.chat.completions.create({
-    model: openaiModel,
-    messages,
-    temperature: 0.7,
-    max_tokens: 220
+if (PROVIDER === 'gemini' && hasGeminiKey) {
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  geminiModel = genAI.getGenerativeModel({
+    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
   });
-
-  return (response.choices?.[0]?.message?.content || "").trim();
+  ACTIVE_PROVIDER = 'gemini';
+} else if (PROVIDER === 'openai' && hasOpenAIKey) {
+  openaiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
+  ACTIVE_PROVIDER = 'openai';
+} else if (hasGeminiKey) {
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  geminiModel = genAI.getGenerativeModel({
+    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+  });
+  ACTIVE_PROVIDER = 'gemini';
+} else if (hasOpenAIKey) {
+  openaiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
+  ACTIVE_PROVIDER = 'openai';
 }
 
-async function chatWithGemini(message, safeHistory, preferredLanguage) {
-  if (!geminiApiKey) {
-    return null;
+// ── Language map ──────────────────────────────────────────────────────────────
+const LANG_NAMES = {
+  auto: 'the same language as the user',
+  en:   'English',
+  ceb:  'Cebuano (Bisaya)',
+  fil:  'Filipino (Tagalog)',
+  es:   'Spanish',
+  ko:   'Korean',
+};
+
+// ── Category context ──────────────────────────────────────────────────────────
+const CAT_CONTEXT = {
+  text:   'The user wants help with writing, editing, or generating text content.',
+  photos: 'The user wants help describing, generating ideas for, or analyzing photos and images.',
+  slides: 'The user wants help creating presentation slides, outlines, or slide content.',
+  videos: 'The user wants help with video concepts, scripts, storyboards, or editing ideas.',
+  '3d':   'The user wants help with 3D modeling concepts, descriptions, or design ideas.',
+};
+
+const LOCAL_PHRASES = {
+  en: {
+    intro: 'Here is a practical AI-style response.',
+    stepHint: 'If you want, I can break this into step-by-step actions.',
+  },
+  ceb: {
+    intro: 'Ani ang praktikal nga tubag, murag AI assistant.',
+    stepHint: 'Kung gusto nimo, himoan tika ug klaro nga step-by-step.',
+  },
+  fil: {
+    intro: 'Narito ang praktikal na sagot na parang AI assistant.',
+    stepHint: 'Kung gusto mo, gagawin ko itong malinaw na step-by-step.',
+  },
+  es: {
+    intro: 'Aqui tienes una respuesta practica, estilo asistente de IA.',
+    stepHint: 'Si quieres, lo convierto en pasos claros.',
+  },
+  ko: {
+    intro: 'AI assistant styleuro siljeongjeogin dabbyeonimnida.',
+    stepHint: 'Wonhamyeon dan-gye byeollo jeongrihae deurilgeyo.',
+  },
+};
+
+function buildLocalReply({ message, language, category }) {
+  const lower = (message || '').toLowerCase();
+  const p = LOCAL_PHRASES[language] || LOCAL_PHRASES.en;
+
+  const byCategory = {
+    text:   'Start with a short outline, then expand each point with one concrete example.',
+    photos: 'Define subject, lighting, camera angle, and mood first before writing the final prompt.',
+    slides: 'Use one idea per slide, add a clear title, then keep each slide to 3 bullet points max.',
+    videos: 'Open with a 5-second hook, then 3 key beats, and finish with one clear call-to-action.',
+    '3d':   'Specify form, scale, materials, and lighting setup first to get a cleaner 3D concept.',
+  };
+
+  let advice = byCategory[category] || byCategory.text;
+
+  if (/(bug|error|fix|issue|not work|dili|wala|problem)/.test(lower)) {
+    advice = 'Check one variable at a time, test each change, and keep only the fix that consistently works.';
+  } else if (/(website|html|css|javascript|api|backend|frontend)/.test(lower)) {
+    advice = 'Define the exact output first, then adjust structure, style, and behavior in small testable steps.';
   }
 
-  const contents = [
-    ...safeHistory.map((m) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }]
-    })),
-    { role: "user", parts: [{ text: message }] }
-  ];
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent?key=${geminiApiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: buildSystemPrompt(preferredLanguage) }]
-        },
-        contents,
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 220
-        }
-      })
-    }
-  );
-
-  if (!response.ok) {
-    const bodyText = await response.text();
-    let errorMessage = bodyText;
-
-    try {
-      const parsed = JSON.parse(bodyText);
-      errorMessage = parsed?.error?.message || bodyText;
-    } catch {
-      // Keep raw text if JSON parse fails.
-    }
-
-    throw new Error(`Gemini API error: ${response.status} ${errorMessage}`);
-  }
-
-  const data = await response.json();
-  const reply = (data.candidates?.[0]?.content?.parts || [])
-    .map((part) => part?.text || "")
-    .join(" ")
-    .trim();
-
-  return reply;
+  return `${p.intro} ${advice} ${p.stepHint}`;
 }
 
-app.post("/api/chat", async (req, res) => {
+// ── API key auth ──────────────────────────────────────────────────────────────
+function extractApiKey(req) {
+  const headerKey = req.get('x-api-key');
+  if (headerKey) return headerKey.trim();
+
+  const auth = req.get('authorization') || '';
+  if (auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
+  return '';
+}
+
+function isValidApiKey(inputKey) {
+  if (!APP_API_KEY || !inputKey) return false;
+  const expected = Buffer.from(APP_API_KEY);
+  const incoming = Buffer.from(inputKey);
+  if (expected.length !== incoming.length) return false;
+  return timingSafeEqual(expected, incoming);
+}
+
+function requireApiKey(req, res, next) {
+  // Keep local UX simple when APP_API_KEY is not configured.
+  if (!APP_API_KEY) return next();
+
+  const incomingKey = extractApiKey(req);
+  if (!isValidApiKey(incomingKey)) {
+    return res.status(401).json({ error: 'Unauthorized: invalid API key' });
+  }
+  return next();
+}
+
+// ── /api/chat ─────────────────────────────────────────────────────────────────
+app.post('/api/chat', requireApiKey, async (req, res) => {
+  const { message, language = 'en', category = 'text' } = req.body;
+  if (!message?.trim()) {
+    return res.status(400).json({ error: 'message is required' });
+  }
+
+  const langName   = LANG_NAMES[language] ?? 'English';
+  const catContext = CAT_CONTEXT[category] ?? '';
+
+  const systemPrompt =
+    `You are Daniel, a warm, helpful, and concise AI assistant. ` +
+    `${catContext} ` +
+    `Always respond in ${langName}. ` +
+    `Keep replies clear and friendly. Limit to 3-4 sentences unless more detail is truly needed.`;
+
   try {
-    const { message, history = [], preferredLanguage = "" } = req.body || {};
+    let reply = '';
 
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Message is required." });
+    if (ACTIVE_PROVIDER === 'gemini' && geminiModel) {
+      const chat   = geminiModel.startChat({ history: [] });
+      const result = await chat.sendMessage(`${systemPrompt}\n\nUser: ${message}`);
+      reply = result.response.text();
+    } else if (ACTIVE_PROVIDER === 'openai' && openaiClient) {
+      const completion = await openaiClient.chat.completions.create({
+        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user',   content: message },
+        ],
+        max_tokens: 400,
+      });
+      reply = completion.choices[0].message.content;
+    } else {
+      reply = buildLocalReply({ message, language, category });
     }
 
-    const safeHistory = normalizeHistory(history);
-
-    let reply = "";
-    let mode = "fallback";
-    let providerError = "";
-
-    try {
-      if (provider === "openai") {
-        reply = (await chatWithOpenAI(message, safeHistory, preferredLanguage)) || "";
-        mode = reply ? "openai" : "fallback";
-      } else {
-        reply = (await chatWithGemini(message, safeHistory, preferredLanguage)) || "";
-        mode = reply ? "gemini" : "fallback";
-      }
-    } catch (error) {
-      providerError = String(error?.message || "Provider request failed.");
-      console.error("provider error:", error);
-    }
-
-    if (!reply) {
-      const lowerError = providerError.toLowerCase();
-      const isQuotaIssue = lowerError.includes("429") || lowerError.includes("quota");
-      reply = isQuotaIssue ? quotaReply(message, preferredLanguage) : fallbackReply(message, preferredLanguage);
-      mode = "fallback";
-    }
-
-    return res.json({ reply, mode, provider, providerError });
-  } catch (error) {
-    console.error("/api/chat error:", error);
-    return res.status(500).json({ error: "Failed to process chat request." });
+    res.json({ reply });
+  } catch (err) {
+    console.error('[AI Error]', err.message);
+    const reply = buildLocalReply({ message, language, category });
+    res.status(200).json({ reply, warning: 'provider_unavailable' });
   }
 });
 
-app.get("/health", (_, res) => {
-  const hasApiKey = provider === "openai" ? Boolean(openaiApiKey) : Boolean(geminiApiKey);
-  const model = provider === "openai" ? openaiModel : geminiModel;
-
-  res.json({ ok: true, provider, model, hasApiKey });
-});
-
-app.listen(port, host, () => {
-  console.log(`Avatar chatbot running at http://${host}:${port}`);
-  console.log(`Provider: ${provider}`);
+// ── Start ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, HOST, () => {
+  console.log(`\n💎 Crystal Prompter running at http://${HOST}:${PORT}`);
+  console.log(`🔐 API key auth: ${APP_API_KEY ? 'enabled' : 'disabled (set APP_API_KEY in .env)'}`);
+  console.log(`🤖 Response mode: ${ACTIVE_PROVIDER}`);
+  console.log('');
 });
