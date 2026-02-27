@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Avatar Chatbot</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="phone">
+        <header class="top-bar">
+          <span class="clock">9:41</span>
+          <div class="title-wrap">
+            <img
+              class="title-logo"
+              src="https://static.wixstatic.com/media/d0630a_9680d5ad465147a4bd244f7b9d0acc44~mv2.png/v1/crop/x_63,y_399,w_937,h_221/fill/w_390,h_100,fp_0.50_0.50,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/CP_edited.png"
+              alt="Chat AI"
+            />
+          </div>
+          <button id="settingsBtn" class="icon-btn" aria-label="Settings">⚙</button>
+        </header>
+
+        <section class="avatar-stage">
+          <div id="avatarWrap" class="avatar-wrap" aria-live="polite">
+            <img src="./avatar-user.png" onerror="this.onerror=null;this.src='./avatar.svg';" alt="AI avatar" />
+            <span class="avatar-mouth" aria-hidden="true"></span>
+            <span class="voice-ring"></span>
+          </div>
+        </section>
+
+        <section class="chat-panel">
+          <div id="chatList" class="chat-list"></div>
+
+          <div id="typingTray" class="typing-tray hidden">
+            <input id="textInput" type="text" placeholder="Type your question..." autocomplete="off" />
+            <button id="sendBtn" class="send-btn" aria-label="Send message">Send</button>
+          </div>
+
+          <footer class="controls">
+            <button id="langBadge" class="mini-btn" title="Current language">EN</button>
+            <button id="micBtn" class="mic-btn" aria-label="Start voice input">
+              <span class="mic-icon">🎤</span>
+            </button>
+            <button id="keyboardBtn" class="mini-btn" aria-label="Toggle keyboard">⌨</button>
+          </footer>
+
+          <p id="statusText" class="status-text">Ready. Ask by voice or text.</p>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>
